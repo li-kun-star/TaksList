@@ -15,7 +15,7 @@
   - 删除：点击任务行右侧「×」直接删除
 - **今日视图**：显示所有未完成任务 + 今日完成的任务；未完成任务跨天自动顺延，昨天的待办今天依然在
 - **开机自启**：设置中一键开关，通过 Windows 注册表 `HKCU\...\Run` 实现
-- **个性化外观**：支持自定义面板背景图、自定义胶囊图标、调节胶囊大小；背景图完整保留原始清晰度
+- **个性化外观**：支持自定义面板背景图、自定义胶囊图标、调节胶囊大小；背景图完整保留原始清晰度；可自定义任务区文字颜色（辅助文字与完成态自动淡化），背景图较暗或花哨时仍看得清
 - **数据安全**：所有变更立即写入本地 `data.json`；文件损坏时自动备份为 `.bak` 并重建，不会崩溃
 - **高分屏适配**：自动感知系统 DPI 缩放
 - **单实例运行**：重复启动会自动聚焦到已有窗口
@@ -54,15 +54,15 @@ python main.py
 
 ### 方式三：自行打包成 exe
 
-项目使用 [PyInstaller](https://pyinstaller.org/) 打包为单文件程序：
+项目使用 [PyInstaller](https://pyinstaller.org/) 打包为单文件程序，仓库内已附带 `FloatTask.spec` 配置（自动带上默认胶囊图标资源）：
 
 ```bash
 pip install pyinstaller pillow
 
-pyinstaller --onefile --noconsole --name TaskList --add-data "20200726060256_nuoes.jpg;." main.py
+pyinstaller --noconfirm FloatTask.spec
 ```
 
-打包完成后，可执行文件位于 `dist/TaskList.exe`。
+打包完成后，可执行文件位于 `dist/FloatTask.exe`；首次运行时会在同目录生成 `data.json`。
 
 ## 使用说明
 
@@ -74,7 +74,7 @@ pyinstaller --onefile --noconsole --name TaskList --add-data "20200726060256_nuo
 | 完成任务 | 点击任务前的复选框 |
 | 编辑任务 | 双击任务行 |
 | 删除任务 | 点击任务行右侧「×」 |
-| 设置（开机自启 / 背景图 / 图标 / 胶囊大小） | 展开面板后点击右上角齿轮图标 |
+| 设置（开机自启 / 背景图 / 文字颜色 / 图标 / 胶囊大小） | 展开面板后点击右上角齿轮图标 |
 
 ## 项目结构
 
@@ -87,7 +87,7 @@ ListAPP-Trae/
 ├── docs/
 │   └── preview.png           # 效果图
 └── dist/
-    └── TaskList.exe          # 已打包的单文件可执行程序（开箱即用）
+    └── FloatTask.exe          # 已打包的单文件可执行程序（开箱即用）
 ```
 
 ## 技术栈

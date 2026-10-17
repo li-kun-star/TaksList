@@ -18,7 +18,7 @@ import tkinter as tk
 import tkinter.font as tkfont
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from tkinter import messagebox, ttk, filedialog
+from tkinter import messagebox, ttk, filedialog, colorchooser
 
 # ---------------- 常量 ----------------
 APP_TITLE = "FloatTask"
@@ -57,6 +57,41 @@ except ImportError:                    # 打包后 PIL 会被 PyInstaller 收进
 def _hex_rgb(c: str):
     c = c.lstrip("#")
     return tuple(int(c[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def _rgb_hex(rgb) -> str:
+    return "#%02X%02X%02X" % tuple(int(round(max(0, min(255, v)))) for v in rgb)
+
+
+def _lum(c: str) -> float:
+    """感知亮度 0-255：判断文字该往浅还是往深淡化"""
+    r, g, b = _hex_rgb(c)
+    return 0.299 * r + 0.587 * g + 0.114 * b
+
+
+def normalize_color(raw) -> str:
+    """校验 #RRGGBB / #RGB；空或非法返回 ""（表示使用内置默认色）"""
+    c = str(raw or "").strip()
+    if re.fullmatch(r"#[0-9a-fA-F]{6}", c):
+        return c.upper()
+    if re.fullmatch(r"#[0-9a-fA-F]{3}", c):
+        return "#" + "".join(ch * 2 for ch in c[1:]).upper()
+    return ""
+
+
+def mix_color(a: str, b: str, t: float) -> str:
+    """a、b 间线性插值（t=0→a，t=1→b），用于从正文色推导辅助/完成态色"""
+    t = max(0.0, min(1.0, float(t)))
+    ra, ga, ba = _hex_rgb(a)
+    rb, gb, bb = _hex_rgb(b)
+    return _rgb_hex((ra + (rb - ra) * t, ga + (gb - ga) * t, ba + (bb - ba) * t))
+
+
+def text_color_palette(main: str):
+    """正文色 → (正文, 辅助, 完成态)。淡色文字往深色淡化，深色文字往纸色淡化。"""
+    main = normalize_color(main) or COL_TEXT
+    mate = "#241C14" if _lum(main) > 150 else COL_PANEL
+    return main, mix_color(main, mate, 0.40), mix_color(main, mate, 0.62)
 
 
 # ---------------- 路径 ----------------
@@ -187,7 +222,7 @@ class TaskStore:
     """data.json 读写；变更即落盘；损坏自动备份重建"""
 
     DEFAULT_SETTINGS = {"autoStart": False, "bgImage": "",
-                        "iconImage": "", "capSize": 48}
+                        "iconImage": "", "capSize": 48, "textColor": ""}
 
     def __init__(self, path: Path):
         self.path = path
@@ -222,6 +257,7 @@ class TaskStore:
                     self.settings["autoStart"] = bool(st.get("autoStart", False))
                     self.settings["bgImage"] = str(st.get("bgImage") or "")
                     self.settings["iconImage"] = str(st.get("iconImage") or "")
+                    self.settings["textColor"] = normalize_color(st.get("textColor"))
                     try:
                         self.settings["capSize"] = min(96, max(24,
                                                        int(st.get("capSize", 48))))
@@ -569,6 +605,7 @@ class App:
         fams = set(tkfont.families(root))
         self.F_CUTE = "幼圆" if "幼圆" in fams else "Microsoft YaHei UI"
         self.F_BODY = "Microsoft YaHei UI"
+        self._refresh_text_colors()   # 任务区文字配色（可在设置里改正文色）
 
         self.pw = int(340 * scale)
         self.ph = int(560 * scale)
@@ -755,15 +792,15 @@ class App:
         sun.pack(side="left", padx=(0, int(4 * s)))
         self.sun_cv = sun
         self._draw_sun(sun, int(22 * s))
-        self.date_lbl = tk.Label(header, bg=self.panel_bg, fg=COL_TEXT,
+        self.date_lbl = tk.Label(header, bg=self.panel_bg, fg=self.col_text,
                                  font=(self.F_CUTE, 12, "bold"))
         self.date_lbl.pack(side="left", pady=int(2 * s))
-        gear = tk.Label(header, text="⚙", bg=self.panel_bg, fg=COL_SUB,
+        gear = tk.Label(header, text="⚙", bg=self.panel_bg, fg=self.col_sub,
                         font=(self.F_CUTE, 14), cursor="hand2")
         gear.pack(side="right", padx=(6, 2))
         gear.bind("<Button-1>", lambda e: self.open_settings())
         gear.bind("<Enter>", lambda e: gear.config(fg=COL_ACCENT_DARK))
-        gear.bind("<Leave>", lambda e: gear.config(fg=COL_SUB))
+        gear.bind("<Leave>", lambda e: gear.config(fg=self.col_sub))
 
         # -- 明天切换按钮（写第二天任务） --
         self.day_btn_wh = (int(58 * s), int(24 * s))
@@ -906,7 +943,7 @@ class App:
                            font=(self.F_CUTE, int(10 * s), "bold"))
         else:
             self._mini_moon(cv, 13 * s, h / 2, 4.2 * s)
-            cv.create_text(w - 17 * s, h / 2, text="明天", fill=COL_TEXT,
+            cv.create_text(w - 17 * s, h / 2, text="明天", fill=self.col_text,
                            font=(self.F_CUTE, int(10 * s), "bold"))
 
     def _draw_add_btn(self, cv, size, hover):
@@ -957,7 +994,7 @@ class App:
         sketch_line(cv, px, py, px + 13 * s, py - 18 * s,
                     "#EAC78A", width=max(2, 3 * s), amp=0.3)
         sketch_line(cv, px + 13 * s, py - 18 * s, px + 16 * s, py - 22 * s,
-                    COL_TEXT, width=max(1, 1.6 * s), amp=0.2)
+                    self.col_sub, width=max(1, 1.6 * s), amp=0.2)
         # 两颗小星星
         for sx, sy, sr, col in ((cx - hw - 14 * s, cy - hh + 2 * s, 5 * s, "#E8AEBF"),
                                 (cx + hw + 18 * s, cy - hh - 6 * s, 4 * s, "#A9B8DE")):
@@ -1324,6 +1361,15 @@ class App:
             return
         self.list_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
 
+    # ---------- 任务区文字颜色 ----------
+    def _refresh_text_colors(self):
+        """从设置取正文色，推导辅助/完成态/高亮色；未设置时沿用内置暖棕"""
+        self.col_text, self.col_sub, self.col_done = text_color_palette(
+            self.store.settings.get("textColor"))
+        # 浅色文字配浅一档的蓝，深色文字配深一档（明天视图的日期高亮）
+        self.col_accent = (COL_ACCENT if _lum(self.col_text) > 150
+                           else COL_ACCENT_DARK)
+
     # ---------- 头部 / 列表 ----------
     def refresh_header(self):
         d = date.today()
@@ -1331,11 +1377,11 @@ class App:
             tm = d + timedelta(days=1)
             self.date_lbl.config(
                 text=f"明天 {tm.month}月{tm.day}日 {WEEK_CN[tm.weekday()]}",
-                fg=COL_ACCENT_DARK)
+                fg=self.col_accent)
         else:
             self.date_lbl.config(
                 text=f"{d.year}年{d.month}月{d.day}日 {WEEK_CN[d.weekday()]}",
-                fg=COL_TEXT)
+                fg=self.col_text)
         self._draw_header_orb(self.sun_cv, int(22 * self.s))
         self._draw_day_toggle()
 
@@ -1356,7 +1402,7 @@ class App:
             cv.bind("<Configure>",
                     lambda e, c=cv: self._draw_empty_doodle(c, e.width, e.height))
             tk.Label(self.rows, text=empty_txt, bg=self.panel_bg,
-                     fg=COL_SUB, font=(self.F_CUTE, 11)).pack(fill="x")
+                     fg=self.col_sub, font=(self.F_CUTE, 11)).pack(fill="x")
         else:
             for i, t in enumerate(undone + done_list):
                 self._make_row(t)
@@ -1375,7 +1421,7 @@ class App:
         row.pack(fill="x", pady=int(3 * s))
         done = t["done"]
         font = (self.F_BODY, 10, "overstrike") if done else (self.F_BODY, 10)
-        fg = COL_DONE if done else COL_TEXT
+        fg = self.col_done if done else self.col_text
 
         # 手绘勾选框
         box = tk.Canvas(row, width=int(18 * s), height=int(18 * s), bg=self.panel_bg,
@@ -1389,16 +1435,16 @@ class App:
                        cursor="hand2")
         lbl.pack(side="left", fill="x", expand=True)
         tmlbl = tk.Label(row, text=t["time"], bg=self.panel_bg,
-                         fg=COL_DONE if done else COL_SUB,
+                         fg=self.col_done if done else self.col_sub,
                          font=(self.F_BODY, 9), width=5, anchor="e")
         tmlbl.pack(side="right", padx=int(4 * s))
-        dlbl = tk.Label(row, text="✕", bg=self.panel_bg, fg=COL_SUB,
+        dlbl = tk.Label(row, text="✕", bg=self.panel_bg, fg=self.col_sub,
                         font=(self.F_BODY, 10), cursor="hand2",
                         padx=int(2 * s))
         dlbl.pack(side="right")
         dlbl.bind("<Button-1>", lambda e: self.on_delete(t["id"]))
         dlbl.bind("<Enter>", lambda e: dlbl.config(fg=COL_DANGER))
-        dlbl.bind("<Leave>", lambda e: dlbl.config(fg=COL_SUB))
+        dlbl.bind("<Leave>", lambda e: dlbl.config(fg=self.col_sub))
         for w in (lbl, tmlbl):
             w.bind("<Double-Button-1>", lambda e, tid=t["id"]: self.open_edit(tid))
 
@@ -1647,7 +1693,7 @@ class App:
             self._settings_dlg.lift()
             return
         s = self.s
-        w, h = int(300 * s), int(416 * s)
+        w, h = int(300 * s), int(540 * s)      # 高度需容纳"文字颜色"一段
         dlg, inner = self._popup(w, h)
         self._settings_dlg = dlg
 
@@ -1709,6 +1755,75 @@ class App:
         tk.Label(inner, text="图片铺满整个面板，任务区白色纸面透出背景图",
                  bg=COL_PANEL, fg=COL_SUB,
                  font=(self.F_BODY, 8)).pack(anchor="w")
+
+        # -- 任务文字颜色（背景图较暗/花哨时用来救可读性） --
+        sep_tc = tk.Canvas(inner, height=int(8 * s), bg=COL_PANEL,
+                           highlightthickness=0, bd=0)
+        sep_tc.pack(fill="x", pady=(int(10 * s), int(6 * s)))
+        sep_tc.bind("<Configure>", lambda e: (
+            e.widget.delete("all"),
+            sketch_line(e.widget, 2, 4, e.width - 2, 4, COL_SEP,
+                        width=max(1, 1.1 * s), amp=1.0)))
+
+        tk.Label(inner, text="任务文字颜色 ✎", bg=COL_PANEL, fg=COL_TEXT,
+                 font=(self.F_CUTE, 11, "bold")).pack(anchor="w")
+        tc_row = tk.Frame(inner, bg=COL_PANEL)
+        tc_row.pack(fill="x", pady=(int(4 * s), 0))
+        swatch = tk.Canvas(tc_row, width=int(44 * s), height=int(22 * s),
+                           bg=COL_PANEL, highlightthickness=0, bd=0)
+        swatch.pack(side="left")
+        color_cur_lbl = tk.Label(inner, text="", bg=COL_PANEL, fg=COL_SUB,
+                                 font=(self.F_BODY, 8), anchor="w")
+        color_cur_lbl.pack(fill="x", pady=(int(3 * s), 0))
+        tk.Label(inner, text="文字压在背景图上时调浅或调深，避免看不清",
+                 bg=COL_PANEL, fg=COL_SUB,
+                 font=(self.F_BODY, 8)).pack(anchor="w")
+
+        def _draw_swatch():
+            """色板预览：正文色 Aa + 完成态色 ✓"""
+            main, _sub, done = text_color_palette(
+                self.store.settings.get("textColor"))
+            swatch.delete("all")
+            swatch.create_rectangle(1, 1, int(43 * s), int(21 * s),
+                                    fill=COL_INPUT_BG, outline=COL_ENTRY_BD)
+            swatch.create_text(int(11 * s), int(11 * s), text="Aa",
+                               fill=main, font=(self.F_BODY, 10, "bold"))
+            swatch.create_text(int(28 * s), int(11 * s), text="✓",
+                               fill=done, font=(self.F_BODY, 10, "bold"))
+            cur = normalize_color(self.store.settings.get("textColor"))
+            color_cur_lbl.config(
+                text=f"当前：{cur}" if cur else "当前：默认暖棕（跟随内置配色）")
+
+        def _apply_text_color(raw):
+            self.store.settings["textColor"] = normalize_color(raw)
+            self.store._save()
+            self._refresh_text_colors()
+            self.refresh_header()
+            self.refresh_list()
+            _draw_swatch()
+            self._check_save_error()
+
+        def _pick_text_color():
+            cur = self.store.settings.get("textColor") or COL_TEXT
+            _rgb, hx = colorchooser.askcolor(
+                color=cur, parent=dlg, title="选择任务文字颜色")
+            if hx:
+                _apply_text_color(hx)
+
+        def _reset_text_color():
+            _apply_text_color("")
+
+        tk.Button(tc_row, text="选择颜色…", command=_pick_text_color,
+                  bg=COL_ACCENT, fg="white", activebackground=COL_ACCENT_DARK,
+                  activeforeground="white", relief="flat", bd=0, cursor="hand2",
+                  font=(self.F_CUTE, 10, "bold"), padx=int(10 * s),
+                  pady=int(3 * s)).pack(side="left", padx=(int(8 * s), 0))
+        tk.Button(tc_row, text="恢复默认", command=_reset_text_color,
+                  bg=COL_INPUT_BG, fg=COL_TEXT, activebackground=COL_BORDER,
+                  relief="flat", bd=0, cursor="hand2", font=(self.F_CUTE, 10),
+                  padx=int(10 * s), pady=int(3 * s)).pack(
+                      side="left", padx=(int(6 * s), 0))
+        _draw_swatch()
 
         # -- 悬浮图标 --
         sep2 = tk.Canvas(inner, height=int(8 * s), bg=COL_PANEL,
@@ -1842,6 +1957,18 @@ def selftest():
     assert normalize_time("abc") is None
     assert normalize_time("") == ""
 
+    # 文字颜色：校验 / 默认配色 / 浅深自适应淡化
+    assert normalize_color("#5b4a3a") == "#5B4A3A"
+    assert normalize_color("#abc") == "#AABBCC"
+    assert normalize_color(" abc") == "" and normalize_color("abc") == ""
+    assert normalize_color("#12345") == "" and normalize_color(None) == ""
+    d_main, d_sub, d_done = text_color_palette("")
+    assert d_main == COL_TEXT and text_color_palette("oops")[0] == COL_TEXT
+    assert _lum(d_main) < _lum(d_sub) < _lum(d_done)      # 默认逐级淡化
+    l_main, l_sub, l_done = text_color_palette("#F2EDE4")  # 浅色文字往深色淡化
+    assert _lum(l_done) < _lum(l_sub) < _lum(l_main)
+    assert mix_color("#000000", "#FFFFFF", 0.5) == "#808080"
+
     s = TaskStore(p)
     a = s.add("写周报", "09:30")
     b = s.add("买咖啡", "")
@@ -1859,6 +1986,15 @@ def selftest():
     assert len(s2.tasks) == 3
     assert s2.tasks[0]["done"] and s2.tasks[0]["completedAt"]
     assert s2.tasks[1]["text"] == "买两杯咖啡" and s2.tasks[1]["time"] == "15:05"
+    assert s2.settings["textColor"] == ""            # 旧文件无此键 → 默认色
+
+    s2.settings["textColor"] = "#F2EDE4"             # 文字颜色落盘 / 重读
+    s2._save()
+    assert TaskStore(p).settings["textColor"] == "#F2EDE4"
+    raw = json.loads(p.read_text(encoding="utf-8"))  # 非法值容错 → 回退默认
+    raw["settings"]["textColor"] = "not-a-color"
+    p.write_text(json.dumps(raw), encoding="utf-8")
+    assert TaskStore(p).settings["textColor"] == ""
 
     p.write_text("{oops", encoding="utf-8")  # 损坏容错
     s3 = TaskStore(p)
