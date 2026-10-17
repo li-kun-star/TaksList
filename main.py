@@ -16,7 +16,7 @@ import ctypes
 import uuid
 import tkinter as tk
 import tkinter.font as tkfont
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from tkinter import messagebox, ttk, filedialog
 
@@ -240,12 +240,12 @@ class TaskStore:
             self.save_error = str(e)
 
     # ---- 操作 ----
-    def add(self, text: str, time_str: str) -> dict:
+    def add(self, text: str, time_str: str, day_offset: int = 0) -> dict:
         t = {
             "id": uuid.uuid4().hex[:8],
             "text": text,
             "time": time_str,
-            "date": date.today().isoformat(),
+            "date": (date.today() + timedelta(days=day_offset)).isoformat(),
             "done": False,
             "completedAt": None,
         }
@@ -276,12 +276,21 @@ class TaskStore:
         self._save()
 
     def today_view(self, today_iso: str):
-        """未完成任务（自动顺延）+ 今日完成的（沉底）"""
-        undone = [t for t in self.tasks if not t["done"]]
+        """未完成任务（自动顺延，未来日期的除外）+ 今日完成的（沉底）"""
+        undone = [t for t in self.tasks
+                  if not t["done"] and t["date"] <= today_iso]
         done_today = [t for t in self.tasks
-                      if t["done"] and (t.get("completedAt") or "")[:10] == today_iso]
+                      if t["done"] and t["date"] <= today_iso
+                      and (t.get("completedAt") or "")[:10] == today_iso]
         done_today.sort(key=lambda t: t.get("completedAt") or "")
         return undone, done_today
+
+    def day_view(self, day_iso: str):
+        """未来某天（如明天）视图：该日期未完成 + 该日期已完成（沉底）"""
+        undone = [t for t in self.tasks if not t["done"] and t["date"] == day_iso]
+        done = [t for t in self.tasks if t["done"] and t["date"] == day_iso]
+        done.sort(key=lambda t: t.get("completedAt") or "")
+        return undone, done
 
 
 # ---------------- 圆形胶囊图片 ----------------
@@ -531,6 +540,7 @@ class App:
         self.store = store
         self.s = scale
         self.today = date.today().isoformat()
+        self.tomorrow_mode = False    # 明天模式：写第二天任务
         self._panel_open = False
         self._suppress = 0            # 弹窗打开时抑制 FocusOut 收起
         self._collapse_job = None
@@ -720,6 +730,7 @@ class App:
         sun = tk.Canvas(header, width=int(22 * s), height=int(22 * s),
                         bg=self.panel_bg, highlightthickness=0, bd=0)
         sun.pack(side="left", padx=(0, int(4 * s)))
+        self.sun_cv = sun
         self._draw_sun(sun, int(22 * s))
         self.date_lbl = tk.Label(header, bg=self.panel_bg, fg=COL_TEXT,
                                  font=(self.F_CUTE, 12, "bold"))
@@ -730,6 +741,16 @@ class App:
         gear.bind("<Button-1>", lambda e: self.open_settings())
         gear.bind("<Enter>", lambda e: gear.config(fg=COL_ACCENT_DARK))
         gear.bind("<Leave>", lambda e: gear.config(fg=COL_SUB))
+
+        # -- 明天切换按钮（写第二天任务） --
+        self.day_btn_wh = (int(58 * s), int(24 * s))
+        self.btn_day = tk.Canvas(header, width=self.day_btn_wh[0],
+                                 height=self.day_btn_wh[1], bg=self.panel_bg,
+                                 highlightthickness=0, bd=0, cursor="hand2")
+        self.btn_day.pack(side="right", padx=(0, int(4 * s)))
+        self.btn_day.bind("<Button-1>", lambda e: self.toggle_day_view())
+        self.btn_day.bind("<Enter>", lambda e: self._draw_day_toggle(hover=True))
+        self.btn_day.bind("<Leave>", lambda e: self._draw_day_toggle())
 
         # -- 输入行 --
         irow = tk.Frame(inner, bg=self.panel_bg, height=input_h)
@@ -803,6 +824,67 @@ class App:
             sketch_line(cv, c + size * 0.36 * math.cos(a), c + size * 0.36 * math.sin(a),
                         c + size * 0.46 * math.cos(a), c + size * 0.46 * math.sin(a),
                         "#EAC78A", width=max(1, 1.2 * self.s), amp=0.2)
+
+    def _mini_sun(self, cv, cx, cy, r):
+        sketch_circle(cv, cx, cy, r, outline="#EAC78A",
+                      width=max(1, self.s), fill="#FCE9C0", amp=0.3)
+        for i in range(8):
+            a = i * math.pi / 4
+            sketch_line(cv, cx + r * 1.35 * math.cos(a), cy + r * 1.35 * math.sin(a),
+                        cx + r * 1.8 * math.cos(a), cy + r * 1.8 * math.sin(a),
+                        "#EAC78A", width=max(1, self.s), amp=0.15)
+
+    def _mini_moon(self, cv, cx, cy, r, bite=None):
+        """手绘小月牙：圆 + 底色圆咬掉一角；bite 缺省用面板底色"""
+        bite = self.panel_bg if bite is None else bite
+        sketch_circle(cv, cx, cy, r, outline="#A9B8DE",
+                      width=max(1, self.s), fill="#DCE4F7", amp=0.3)
+        cv.create_oval(cx + r * 0.25 - r * 0.95, cy - r * 0.45 - r * 0.95,
+                       cx + r * 0.25 + r * 0.95, cy - r * 0.45 + r * 0.95,
+                       fill=bite, outline="")
+
+    def _draw_header_orb(self, cv, size):
+        """头部小涂鸦：今天画太阳，明天模式画月亮 + 小星星"""
+        cv.delete("all")
+        if not self.tomorrow_mode:
+            self._draw_sun(cv, size)
+            return
+        c = size / 2
+        r = size * 0.30
+        sketch_circle(cv, c, c, r, outline="#A9B8DE",
+                      width=max(1, 1.4 * self.s), fill="#DCE4F7", amp=0.5)
+        cv.create_oval(c + r * 0.2 - r * 0.95, c - r * 0.45 - r * 0.95,
+                       c + r * 0.2 + r * 0.95, c - r * 0.45 + r * 0.95,
+                       fill=self.panel_bg, outline="")
+        sx, sy, sr = c + r * 1.05, c - r * 0.95, r * 0.28
+        cv.create_line(sx - sr, sy, sx + sr, sy, fill="#EAC78A",
+                       width=max(1, self.s), capstyle="round")
+        cv.create_line(sx, sy - sr, sx, sy + sr, fill="#EAC78A",
+                       width=max(1, self.s), capstyle="round")
+
+    def _draw_day_toggle(self, hover=False):
+        """明天/今天切换小胶囊：今天视图时显示"明天"，明天视图时高亮显示"今天" """
+        cv = self.btn_day
+        s = self.s
+        w, h = self.day_btn_wh
+        cv.delete("all")
+        x1, y1, x2, y2 = 1.5 * s, 1.5 * s, w - 1.5 * s, h - 1.5 * s
+        active = self.tomorrow_mode
+        if active:
+            cv.create_polygon(
+                rounded_rect_pts(x1, y1, x2, y2, (y2 - y1) / 2),
+                fill=COL_ACCENT_DARK if hover else COL_ACCENT, outline="")
+        sketch_rect(cv, x1, y1, x2, y2,
+                    COL_ACCENT_DARK if (active or hover) else COL_PENCIL,
+                    width=max(1, 1.3 * s), amp=0.6)
+        if active:
+            self._mini_sun(cv, 13 * s, h / 2, 4.2 * s)
+            cv.create_text(w - 17 * s, h / 2, text="今天", fill="white",
+                           font=(self.F_CUTE, int(10 * s), "bold"))
+        else:
+            self._mini_moon(cv, 13 * s, h / 2, 4.2 * s)
+            cv.create_text(w - 17 * s, h / 2, text="明天", fill=COL_TEXT,
+                           font=(self.F_CUTE, int(10 * s), "bold"))
 
     def _draw_add_btn(self, cv, size, hover):
         cv.delete("all")
@@ -914,25 +996,40 @@ class App:
     # ---------- 头部 / 列表 ----------
     def refresh_header(self):
         d = date.today()
-        self.date_lbl.config(
-            text=f"{d.year}年{d.month}月{d.day}日 {WEEK_CN[d.weekday()]}")
+        if self.tomorrow_mode:
+            tm = d + timedelta(days=1)
+            self.date_lbl.config(
+                text=f"明天 {tm.month}月{tm.day}日 {WEEK_CN[tm.weekday()]}",
+                fg=COL_ACCENT_DARK)
+        else:
+            self.date_lbl.config(
+                text=f"{d.year}年{d.month}月{d.day}日 {WEEK_CN[d.weekday()]}",
+                fg=COL_TEXT)
+        self._draw_header_orb(self.sun_cv, int(22 * self.s))
+        self._draw_day_toggle()
 
     def refresh_list(self):
         for w in self.rows.winfo_children():
             w.destroy()
-        undone, done_today = self.store.today_view(self.today)
-        if not undone and not done_today:
+        if self.tomorrow_mode:
+            tm = (date.today() + timedelta(days=1)).isoformat()
+            undone, done_list = self.store.day_view(tm)
+            empty_txt = "明天还没有任务，先规划一条吧 ~"
+        else:
+            undone, done_list = self.store.today_view(self.today)
+            empty_txt = "今天没有任务，写一条吧 ~"
+        if not undone and not done_list:
             cv = tk.Canvas(self.rows, bg=self.panel_bg, highlightthickness=0, bd=0,
                            height=int(100 * self.s))
             cv.pack(fill="x", pady=(int(26 * self.s), int(2 * self.s)))
             cv.bind("<Configure>",
                     lambda e, c=cv: self._draw_empty_doodle(c, e.width, e.height))
-            tk.Label(self.rows, text="今天没有任务，写一条吧 ~", bg=self.panel_bg,
+            tk.Label(self.rows, text=empty_txt, bg=self.panel_bg,
                      fg=COL_SUB, font=(self.F_CUTE, 11)).pack(fill="x")
         else:
-            for i, t in enumerate(undone + done_today):
+            for i, t in enumerate(undone + done_list):
                 self._make_row(t)
-                if i < len(undone) + len(done_today) - 1:
+                if i < len(undone) + len(done_list) - 1:
                     sep = tk.Canvas(self.rows, bg=self.panel_bg, highlightthickness=0,
                                     bd=0, height=int(5 * self.s))
                     sep.pack(fill="x")
@@ -975,6 +1072,14 @@ class App:
             w.bind("<Double-Button-1>", lambda e, tid=t["id"]: self.open_edit(tid))
 
     # ---------- 任务操作 ----------
+    def toggle_day_view(self):
+        """今天 ⇄ 明天 视图切换：明天模式下新增的任务记到明天"""
+        self.tomorrow_mode = not self.tomorrow_mode
+        self.hint_lbl.config(text="")
+        self.refresh_header()
+        self.refresh_list()
+        self.entry_text.focus_set()
+
     def add_from_input(self):
         text = self.entry_text.get().strip()
         if not text:
@@ -984,11 +1089,13 @@ class App:
         if t is None:
             self._hint("时间格式：HH:MM，可留空")
             return
-        self.store.add(text, t)
+        self.store.add(text, t, day_offset=1 if self.tomorrow_mode else 0)
         self.entry_text.delete(0, "end")
         self.entry_time.delete(0, "end")
         self.entry_text.focus_set()
         self.refresh_list()
+        if self.tomorrow_mode:
+            self._hint("已加入明天的清单 ✓", COL_CHECK)
         self._check_save_error()
 
     def on_toggle(self, tid):
@@ -1001,8 +1108,8 @@ class App:
         self.refresh_list()
         self._check_save_error()
 
-    def _hint(self, text):
-        self.hint_lbl.config(text=text, fg=COL_DANGER)
+    def _hint(self, text, color=COL_DANGER):
+        self.hint_lbl.config(text=text, fg=color)
         if self._hint_job:
             try:
                 self.root.after_cancel(self._hint_job)
@@ -1181,6 +1288,8 @@ class App:
             bs = int(32 * self.s)
             self.btn_add.configure(bg=self.panel_bg)
             self._draw_add_btn(self.btn_add, bs, hover=False)
+            # 头部太阳/月亮与明天按钮重绘（月牙咬口用了 panel_bg 色）
+            self.refresh_header()
 
     def _set_tree_bg(self, widget, bg):
         """递归把一个容器及其所有后代的 bg 设为指定色（仅处理 Frame/Canvas/Label 等有 bg 的）"""
@@ -1371,6 +1480,7 @@ class App:
         d = date.today().isoformat()
         if d != self.today:
             self.today = d
+            self.tomorrow_mode = False     # 跨天：昨天的"明天"已成为今天
             self.refresh_header()
             self.refresh_list()
         self.root.after(30000, self._tick)
@@ -1396,13 +1506,18 @@ def selftest():
     s = TaskStore(p)
     a = s.add("写周报", "09:30")
     b = s.add("买咖啡", "")
+    c = s.add("明天的事", "", day_offset=1)
+    assert c["date"] == (date.today() + timedelta(days=1)).isoformat()
     s.toggle(a["id"])
-    undone, done = s.today_view(date.today().isoformat())
+    today_iso = date.today().isoformat()
+    undone, done = s.today_view(today_iso)
     assert [t["id"] for t in undone] == [b["id"]] and len(done) == 1
+    undone_tm, done_tm = s.day_view(c["date"])
+    assert [t["id"] for t in undone_tm] == [c["id"]] and done_tm == []
     s.update(b["id"], "买两杯咖啡", "15:05")
 
     s2 = TaskStore(p)                       # 重启恢复
-    assert len(s2.tasks) == 2
+    assert len(s2.tasks) == 3
     assert s2.tasks[0]["done"] and s2.tasks[0]["completedAt"]
     assert s2.tasks[1]["text"] == "买两杯咖啡" and s2.tasks[1]["time"] == "15:05"
 
