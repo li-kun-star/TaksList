@@ -114,6 +114,23 @@ def ensure_single_instance():
         sys.exit(0)
 
 
+def _noactivate(win):
+    """给窗口加 WS_EX_NOACTIVATE：永不抢键盘焦点（背景衬底窗口用）"""
+    try:
+        import ctypes.wintypes as wt
+        u32 = ctypes.windll.user32
+        hwnd = wt.HWND(int(win.wm_frame(), 16))
+        u32.GetWindowLongW.restype = wt.LONG
+        u32.GetWindowLongW.argtypes = [wt.HWND, ctypes.c_int]
+        u32.SetWindowLongW.argtypes = [wt.HWND, ctypes.c_int, wt.LONG]
+        GWL_EXSTYLE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW = -20, 0x08000000, 0x80
+        ex = u32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        u32.SetWindowLongW(hwnd, GWL_EXSTYLE,
+                           ex | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW)
+    except Exception:
+        pass
+
+
 # ---------------- 开机自启（注册表 HKCU\\...\\Run） ----------------
 def _autostart_command() -> str:
     if getattr(sys, "frozen", False):
@@ -673,6 +690,7 @@ class App:
         ny = min(max(0, d[3] + e.y_root - d[1]),
                  p.winfo_screenheight() - self.ph)
         p.geometry(f"+{nx}+{ny}")
+        self._sync_bg_win(f"+{nx}+{ny}")
 
     # ---------- 任务面板（展开态） ----------
     def _build_panel(self):
@@ -694,10 +712,9 @@ class App:
         cv.pack(fill="both", expand=True)
         self.panel_cv = cv
 
-        has_bg = bool(self.store.settings.get("bgImage", ""))
+        bg_path = self.store.settings.get("bgImage", "")
         # 手绘背景（自定义图片完整铺满 / 奶油纸 + 涂鸦相框）
-        self._bg_photo = render_panel_bg(
-            self.pw, self.ph, s, self.store.settings.get("bgImage", ""))
+        self._bg_photo = render_panel_bg(self.pw, self.ph, s, bg_path)
         if self._bg_photo is not None:
             self._bg_item = cv.create_image(0, 0, anchor="nw", image=self._bg_photo)
         else:
@@ -706,12 +723,18 @@ class App:
                 fill=COL_PANEL, outline=COL_BORDER, width=1)
         cv.tag_lower(self._bg_item)
 
+        # 自定义背景图：任务区纸面用透明色"挖洞"，露出垫在下面的背景衬底窗口。
+        # 注意：-transparentcolor 是按窗口最终像素生效的，图片若画在同一窗口里
+        # 会被连同洞一起抠掉（露出桌面），所以图片必须单独放一层窗口。
+        self._bg_live = bool(bg_path) and self._bg_photo is not None
+        self._build_bg_win()
+
         # 边缘相框拖动面板（内容区被 inner 覆盖，只有相框圈响应）
         cv.bind("<ButtonPress-1>", self._pan_press)
         cv.bind("<B1-Motion>", self._pan_move)
 
         # panel_bg：有自定义背景图时 inner 区需透明 → 用 MAGIC；否则用奶油纸
-        self.panel_bg = MAGIC if has_bg else COL_PANEL
+        self.panel_bg = MAGIC if self._bg_live else COL_PANEL
 
         inner = tk.Frame(cv, bg=self.panel_bg)
         cv.create_window((pad, pad), window=inner, anchor="nw",
@@ -955,22 +978,321 @@ class App:
         self.refresh_list()
         px = self.cap_x - 6 - self.pw
         py = max(0, self.cap_y + (self.cap_size - self.ph) // 2)
-        self.panel.geometry(f"{self.pw}x{self.ph}+{max(px, 0)}+{py}")
+        geom = f"{self.pw}x{self.ph}+{max(px, 0)}+{py}"
+        self._panel_open = True
+        self._sync_bg_win(geom)          # 衬底层先就位，面板再盖上去
+        self.panel.geometry(geom)
         self.panel.deiconify()
         self.panel.lift()
-        self._panel_open = True
         try:
             self.panel.focus_force()
         except tk.TclError:
             pass
         self.entry_text.focus_set()
+        self._cancel_hover_poll()
+        self._hover_poll()                 # 启动悬停轮询兜底
 
     def collapse(self):
         self._cancel_collapse()
         if not self._panel_open:
             return
+        self._cancel_hover_poll()
         self.panel.withdraw()
         self._panel_open = False
+        self._hover = None
+        self._grab = None
+        self._b1_last = None
+        self._press_focus = None
+        self._sync_bg_win()
+
+    # ---------- 背景衬底层（自定义背景图专用） ----------
+    def _build_bg_win(self):
+        """与面板同形同位的衬底窗口，永远垫在面板下方。
+        任务区透明色挖洞后露出的就是这层图片，而不是桌面。"""
+        bw = tk.Toplevel(self.root)
+        bw.overrideredirect(True)
+        bw.configure(bg=MAGIC)
+        bw.attributes("-topmost", True)
+        try:
+            bw.attributes("-transparentcolor", MAGIC)
+        except tk.TclError:
+            pass
+        bw.withdraw()
+        bcv = tk.Canvas(bw, bg=MAGIC, highlightthickness=0, bd=0)
+        bcv.pack(fill="both", expand=True)
+        self._bg_win_item = None
+        if self._bg_photo is not None:
+            self._bg_win_item = bcv.create_image(0, 0, anchor="nw",
+                                                 image=self._bg_photo)
+        self.bg_win, self.bg_cv = bw, bcv
+        self._apply_noactivate()         # 构建时先应用一次
+        # Tk 在窗口每次映射（deiconify）时会按内部状态重写扩展样式，
+        # 手动加的 WS_EX_NOACTIVATE 会被抹掉，必须在 <Map> 后重新应用。
+        bw.bind("<Map>", lambda e: self._apply_noactivate(), add="+")
+
+        # 透明像素不接收鼠标输入，点击会落到这层图片窗口上。
+        # 把这些事件按坐标转发给面板上的控件，保证按钮整块区域都能点。
+        self._hover = None
+        self._grab = None
+        self._press_focus = None
+        self._b1_last = None             # 透明区多击判定的上次按下
+        for seq in ("<Button-1>", "<Double-Button-1>", "<Triple-Button-1>",
+                    "<ButtonRelease-1>", "<B1-Motion>"):
+            bcv.bind(seq, lambda e, s=seq: self._bg_proxy(e, s))
+        # Enter 也要绑：指针首次移入衬底层时 Tk 可能只派发 Enter 没有 Motion；
+        # 另有 after 轮询兜底（点击抓取结束后的第一次移动也可能丢 Motion）
+        bcv.bind("<Motion>", lambda e: self._hover_sync())
+        bcv.bind("<Enter>", lambda e: self._hover_sync())
+        bcv.bind("<Leave>", lambda e: self.panel.after_idle(self._hover_sync))
+        self._hover_poll_job = None
+
+    def _apply_noactivate(self):
+        """重新给衬底窗口加 WS_EX_NOACTIVATE（被 Tk 重写样式后补救）"""
+        bw = getattr(self, "bg_win", None)
+        if bw is not None:
+            _noactivate(bw)
+
+    def _hwnd_of(self, w):
+        try:
+            return int(w.wm_frame(), 16)
+        except (tk.TclError, AttributeError):
+            return 0
+
+    def _foreground_is_own(self):
+        """前台窗口是否仍属于本应用（面板 / 衬底层 / 胶囊）"""
+        try:
+            fg = ctypes.windll.user32.GetForegroundWindow()
+        except Exception:
+            return False
+        own = {self._hwnd_of(self.panel), self._hwnd_of(self.root)}
+        bw = getattr(self, "bg_win", None)
+        if bw is not None:
+            own.add(self._hwnd_of(bw))
+        return fg in own
+
+    def _widget_at(self, rootx, rooty):
+        """找面板上屏幕坐标 (rootx, rooty) 处最深的可见控件"""
+        def walk(w):
+            hit = None
+            for c in w.winfo_children():
+                try:
+                    if not c.winfo_ismapped():
+                        continue
+                    x, y = c.winfo_rootx(), c.winfo_rooty()
+                    if (x <= rootx < x + c.winfo_width() and
+                            y <= rooty < y + c.winfo_height()):
+                        hit = walk(c) or c
+                except tk.TclError:
+                    continue
+            return hit
+        return walk(self.panel)
+
+    def _gen(self, w, seq, x=0, y=0, rootx=0, rooty=0, when="tail", **kw):
+        try:
+            w.event_generate(seq, x=x, y=y, rootx=rootx, rooty=rooty,
+                             when=when, **kw)
+        except tk.TclError:
+            pass
+
+    @staticmethod
+    def _alive(w):
+        try:
+            return bool(w.winfo_exists())
+        except tk.TclError:
+            return False
+
+    def _bg_proxy(self, e, seq):
+        """把图片层收到的鼠标事件转发给面板上对应的控件。
+        不转发的话按钮就只有画出来的线条/色块能点（要点得很准、易误触），
+        而且穿透点击会让面板失焦自动收起。事件必须 when=now 同步派发：
+        Tk 禁止 event_generate 合成 Double，双击/三击全靠 Tk 对同一控件上
+        时间连续的 Button-1 自行识别，tail 排队会打断这一判定。"""
+        if not self._panel_open or self._suppress > 0:
+            return
+        # 平台若直接把第二次按下报成 Double/Triple，统一按一次按下处理
+        if seq in ("<Double-Button-1>", "<Triple-Button-1>"):
+            seq = "<Button-1>"
+        if seq in ("<B1-Motion>", "<ButtonRelease-1>") \
+                and self._grab is not None and self._alive(self._grab):
+            w = self._grab                 # 模拟 Tk 的隐式鼠标抓取：拖动跟随按下时的控件
+        else:
+            w = self._widget_at(e.x_root, e.y_root) or self.panel
+        if not self._alive(w):
+            w = self.panel
+        ev = dict(x=e.x_root - w.winfo_rootx(),
+                  y=e.y_root - w.winfo_rooty(), rootx=e.x_root, rooty=e.y_root,
+                  button=getattr(e, "num", 1), state=getattr(e, "state", 0))
+        if seq == "<Button-1>":
+            self._grab = w
+            # 记录可输入目标，供焦点抖动后把键盘焦点还给它
+            self._press_focus = w if self._is_editable(w) else None
+            self._dispatch_press(w, e, ev)
+        else:
+            self._gen(w, seq, when="now", **ev)
+        if seq == "<ButtonRelease-1>":
+            self._grab = None
+        self._cancel_collapse()
+        self.panel.after_idle(self._keep_focus)
+
+    def _dispatch_press(self, w, e, ev):
+        """转发按下并让 Tk 正确识别多击。物理按下先落在衬底层窗口，
+        Tk 的跨窗口多击计数会被它反复冲掉，所以第二/三击时先静默补发
+        count-1 个按下（临时摘掉 widget 级 Button-1 脚本，只重建计数、
+        不产生单击副作用），再正式派发——此时 Tk 会同时命中
+        Button-1 / Double-Button-1(/Triple) 序列，副作用次数与原生一致。"""
+        try:
+            now_ms = int(getattr(e, "time", 0) or
+                         ctypes.windll.kernel32.GetTickCount())
+            u32 = ctypes.windll.user32
+            last = getattr(self, "_b1_last", None)
+            dbl_t = u32.GetDoubleClickTime()
+            mx = max(2, u32.GetSystemMetrics(36) // 2)   # SM_CXDOUBLECLK
+            my = max(2, u32.GetSystemMetrics(37) // 2)   # SM_CYDOUBLECLK
+            if (last is not None and last[0] is w
+                    and 0 <= now_ms - last[1] <= dbl_t
+                    and abs(e.x_root - last[2]) <= mx
+                    and abs(e.y_root - last[3]) <= my):
+                count = min(3, last[4] + 1)
+            else:
+                count = 1
+            self._b1_last = (w, now_ms, e.x_root, e.y_root, count)
+        except Exception:
+            count = 1
+            self._b1_last = None
+
+        if count <= 1:
+            self._gen(w, "<Button-1>", when="now", **ev)
+            return
+        try:
+            saved = w.bind("<Button-1>")
+            w.bind("<Button-1>", "")
+            for _ in range(count - 1):
+                self._gen(w, "<Button-1>", when="now", **ev)
+            w.bind("<Button-1>", saved)
+        except tk.TclError:
+            pass
+        self._gen(w, "<Button-1>", when="now", **ev)
+
+    @staticmethod
+    def _is_editable(w):
+        try:
+            return w.winfo_class() in ("Entry", "TEntry", "Text", "TText",
+                                       "Spinbox", "TSpinbox", "Combobox",
+                                       "TCombobox")
+        except tk.TclError:
+            return False
+
+    def _restore_press_focus(self):
+        """把键盘焦点还给最近一次点击的输入框（幂等，可被多次调用）"""
+        target = getattr(self, "_press_focus", None)
+        if target is not None and self._alive(target):
+            try:
+                target.focus_set()
+            except tk.TclError:
+                pass
+
+    def _keep_focus(self):
+        """点击落在透明区时焦点会在衬底层/面板间抖动，这里做最终校正：
+        点的是输入框就把键盘焦点还给它，其余情况确保焦点留在面板内，避免误收起"""
+        self._cancel_collapse()
+        target = getattr(self, "_press_focus", None)
+        if target is not None and self._alive(target):
+            try:
+                target.focus_set()
+                return
+            except tk.TclError:
+                pass
+        fw = self.root.focus_get()
+        panel = str(self.panel)
+        if fw is not None and (fw is self.panel or str(fw).startswith(panel + ".")):
+            return
+        try:
+            self.panel.focus_force()
+        except tk.TclError:
+            pass
+
+    def _hover_sync(self):
+        """光标在透明区时按位置合成 <Enter>/<Leave>，悬停高亮与不透明区一致"""
+        if not self._panel_open or self._suppress > 0:
+            return
+        try:
+            x, y = self.root.winfo_pointerxy()
+        except tk.TclError:
+            return
+        w = self._widget_at(x, y)
+        # 即使悬停目标没变，也要保证衬底层光标与之一致（首次进入/重绘后）
+        self._sync_proxy_cursor(w)
+        if w is self._hover:
+            return
+        old, self._hover = self._hover, w
+        if old is not None:
+            self._gen(old, "<Leave>", rootx=x, rooty=y)
+        if w is not None:
+            self._gen(w, "<Enter>", rootx=x, rooty=y)
+
+    def _cursor_of(self, w):
+        """控件声明的光标；ttk.Entry 自身未声明时补 IBeam"""
+        try:
+            cur = str(w.cget("cursor"))
+        except tk.TclError:
+            return ""
+        if cur:
+            return cur
+        try:
+            if w.winfo_class() == "TEntry":
+                return "xterm"
+        except tk.TclError:
+            pass
+        return ""
+
+    def _sync_proxy_cursor(self, w):
+        """透明区实际命中的是衬底窗口：按面板上命中控件的光标设置衬底层光标，
+        否则只有压中手绘笔画像素时才显示手型。"""
+        cur = self._cursor_of(w) if w is not None else ""
+        bcv = getattr(self, "bg_cv", None)
+        if bcv is None:
+            return
+        try:
+            if str(bcv.cget("cursor")) != cur:
+                bcv.configure(cursor=cur)
+        except tk.TclError:
+            pass
+
+    def _cancel_hover_poll(self):
+        job = getattr(self, "_hover_poll_job", None)
+        if job is not None:
+            try:
+                self.panel.after_cancel(job)
+            except tk.TclError:
+                pass
+        self._hover_poll_job = None
+
+    def _hover_poll(self):
+        """定时轮询指针位置同步悬停态。只依赖 Enter/Motion 在两种场景会丢事件：
+        指针首次进入衬底层、一次点击抓取结束后的首次移动。"""
+        self._hover_poll_job = None
+        if self._panel_open:
+            if self._suppress == 0:
+                self._hover_sync()
+            self._hover_poll_job = self.panel.after(70, self._hover_poll)
+
+    def _sync_bg_win(self, geom=""):
+        """跟随面板移动/显隐；图片层始终压在面板下方"""
+        bw = getattr(self, "bg_win", None)
+        if bw is None:
+            return
+        if geom:
+            bw.geometry(geom)
+        if self._bg_live and self._panel_open:
+            if bw.state() != "normal":
+                bw.deiconify()
+                bw.lift()
+                self.panel.lift()
+                self._apply_noactivate()
+                # <Map> 回调之外再兜底一次，确保映射完成后样式仍在
+                self.panel.after_idle(self._apply_noactivate)
+        else:
+            bw.withdraw()
 
     def _cancel_collapse(self):
         if self._collapse_job:
@@ -984,6 +1306,15 @@ class App:
         if getattr(e, "detail", "") == "NotifyInferior":
             return
         if self._suppress > 0:
+            return
+        # 点击穿透到衬底窗口时 Tk 会报 detail 为空的 FocusOut；
+        # 只要前台仍是本应用的窗口（衬底层/胶囊），就不是真正失焦，不收起
+        if self._foreground_is_own():
+            # 本应用窗口间的焦点抖动可能把键盘焦点带离刚点中的输入框，
+            # 在本轮 Windows 消息处理完后校正回去
+            target = getattr(self, "_press_focus", None)
+            if target is not None and self._alive(target):
+                self.panel.after_idle(self._restore_press_focus)
             return
         self._cancel_collapse()
         self._collapse_job = self.panel.after(120, self.collapse)
@@ -1257,20 +1588,26 @@ class App:
 
     # ---------- 设置 ----------
     def _reload_bg(self):
-        has_bg = bool(self.store.settings.get("bgImage", ""))
-        new_bg = MAGIC if has_bg else COL_PANEL
-        photo = render_panel_bg(self.pw, self.ph, self.s,
-                                self.store.settings.get("bgImage", ""))
+        img_path = self.store.settings.get("bgImage", "")
+        photo = render_panel_bg(self.pw, self.ph, self.s, img_path)
+        # 只有图片确实渲染成功才启用透明任务区；否则回退奶油纸，不能挖洞露桌面
+        self._bg_live = bool(img_path) and photo is not None
+        if photo is None:
+            photo = render_panel_bg(self.pw, self.ph, self.s, "")
         if photo is not None:
             self._bg_photo = photo
             self.panel_cv.delete(self._bg_item)
             self._bg_item = self.panel_cv.create_image(0, 0, anchor="nw",
                                                        image=self._bg_photo)
             self.panel_cv.tag_lower(self._bg_item)
+            if getattr(self, "bg_cv", None) is not None:
+                self.bg_cv.delete("all")
+                self.bg_cv.create_image(0, 0, anchor="nw", image=photo)
 
         # panel_bg 切换 + 递归刷新 inner 所有子控件 bg
         old_bg = self.panel_bg
-        self.panel_bg = new_bg
+        self.panel_bg = MAGIC if self._bg_live else COL_PANEL
+        new_bg = self.panel_bg
         if old_bg != new_bg:
             # 只改 inner 子树，panel_cv 自身 bg 必须保持 MAGIC
             # inner 是 panel_cv 里唯一的 window 项
@@ -1290,6 +1627,8 @@ class App:
             self._draw_add_btn(self.btn_add, bs, hover=False)
             # 头部太阳/月亮与明天按钮重绘（月牙咬口用了 panel_bg 色）
             self.refresh_header()
+        # 衬底窗口显隐同步（清除背景图时立即消失，恢复原样）
+        self._sync_bg_win(self.panel.geometry())
 
     def _set_tree_bg(self, widget, bg):
         """递归把一个容器及其所有后代的 bg 设为指定色（仅处理 Frame/Canvas/Label 等有 bg 的）"""
@@ -1367,7 +1706,7 @@ class App:
                             bg=COL_PANEL, fg=COL_SUB, font=(self.F_BODY, 8),
                             anchor="w", wraplength=w - 40, justify="left")
         name_lbl.pack(fill="x", pady=(int(3 * s), 0))
-        tk.Label(inner, text="图片铺满面板四周相框，任务区保持纸面清晰",
+        tk.Label(inner, text="图片铺满整个面板，任务区白色纸面透出背景图",
                  bg=COL_PANEL, fg=COL_SUB,
                  font=(self.F_BODY, 8)).pack(anchor="w")
 
